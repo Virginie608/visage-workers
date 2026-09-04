@@ -1,0 +1,58 @@
+# Visage resolve-worker over GitHub Actions. Auto-generated + auto-wired by
+# the panel's "Set up GitHub workers" action — see control/github_setup.py.
+
+name: visage-resolve-worker
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    concurrency:
+      group: visage-worker-${{ matrix.slot }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3]
+    steps:
+      - name: Join tailnet (ephemeral)
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up \
+            --authkey="${{ secrets.TS_EPHEMERAL_AUTHKEY }}" \
+            --hostname="gh-worker-${{ matrix.slot }}-${{ github.run_id }}"
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Clone visage (self-hosted, read-only — never GitHub)
+        env:
+          VISAGE_GIT_URL: ${{ secrets.VISAGE_GIT_URL }}
+        run: git clone --depth 1 "$VISAGE_GIT_URL" visage
+
+      - name: Install dependencies
+        working-directory: visage
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync
+
+      - name: Run resolve worker
+        working-directory: visage
+        env:
+          VISAGE_ENROLL_TOKEN: ${{ secrets.VISAGE_ENROLL_TOKEN }}
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          timeout 20100 uv run visage agent \
+            --panel "$PANEL_URL" \
+            --enroll-token "$VISAGE_ENROLL_TOKEN" \
+            --ephemeral || true
+
+      - name: Leave tailnet
+        if: always()
+        run: sudo tailscale logout || true
