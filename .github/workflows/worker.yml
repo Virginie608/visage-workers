@@ -1,31 +1,52 @@
-# Visage resolve-worker over GitHub Actions. Auto-generated + auto-wired by
-# the panel's "Set up GitHub workers" action — see control/github_setup.py.
+# Visage worker over GitHub Actions. Auto-generated + auto-wired by the panel's
+# "Set up GitHub workers" action — see control/github_setup.py.
+#
+# Roles: each run has 3 slots — 1 resolves (scrapes profiles -> image tasks),
+# 2 download images (image throughput is the bottleneck). Each passes its role
+# to `visage agent`, which reports it at enroll so the panel pins it.
+#
+# IP rotation: a run only lives ~30 min, then slot 1 re-dispatches the
+# workflow, so a NEW run spins up on brand-new runners = new machines = new exit
+# IPs. That fresh-IP cycle repeats forever. The workflow-level concurrency group
+# keeps exactly one run active at a time (no runaway fan-out), and the schedule
+# is a safety net that revives the chain if a re-dispatch is ever missed.
+#
+# Self-re-dispatch needs WORKER_DISPATCH_TOKEN (a token with actions:write on
+# this repo) — the panel sets it automatically. Without it, rotation falls back
+# to the (approximate) schedule below.
 
-name: visage-resolve-worker
+name: visage-worker
 
 on:
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "*/30 * * * *"   # fallback / safety net; GitHub schedule timing is approximate
   workflow_dispatch: {}
+
+concurrency:
+  group: visage-worker        # one active run fleet-wide; the chain rotates it
+  cancel-in-progress: false
 
 jobs:
   worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
-    concurrency:
-      group: visage-worker-${{ matrix.slot }}
-      cancel-in-progress: false
+    timeout-minutes: 40       # ~30 min of work + setup + re-dispatch margin
     strategy:
       fail-fast: false
       matrix:
-        slot: [1, 2, 3]
+        include:
+          - slot: 1
+            role: resolve
+          - slot: 2
+            role: image
+          - slot: 3
+            role: image
     steps:
       - name: Join tailnet (ephemeral)
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up \
             --authkey="${{ secrets.TS_EPHEMERAL_AUTHKEY }}" \
-            --hostname="gh-worker-${{ matrix.slot }}-${{ github.run_id }}"
+            --hostname="gh-${{ matrix.role }}-${{ matrix.slot }}-${{ github.run_id }}"
 
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -41,18 +62,38 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           uv sync
 
-      - name: Run resolve worker
+      - name: Run worker (${{ matrix.role }}) for ~30 min
         working-directory: visage
         env:
           VISAGE_ENROLL_TOKEN: ${{ secrets.VISAGE_ENROLL_TOKEN }}
           PANEL_URL: ${{ secrets.PANEL_URL }}
+          WORKER_ROLE: ${{ matrix.role }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          timeout 20100 uv run visage agent \
+          timeout 1800 uv run visage agent \
             --panel "$PANEL_URL" \
             --enroll-token "$VISAGE_ENROLL_TOKEN" \
+            --role "$WORKER_ROLE" \
             --ephemeral || true
 
       - name: Leave tailnet
         if: always()
         run: sudo tailscale logout || true
+
+      # Only slot 1 re-dispatches, so each cycle starts exactly ONE new run.
+      - name: Rotate — start a fresh run on new runners (new IPs)
+        if: always() && matrix.slot == 1
+        env:
+          DISPATCH_TOKEN: ${{ secrets.WORKER_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "no WORKER_DISPATCH_TOKEN set — rotation falls back to the schedule"; exit 0
+          fi
+          api="https://api.github.com/repos/${{ github.repository }}"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$api/actions/workflows/worker.yml/dispatches" \
+            -d '{"ref":"${{ github.ref_name }}"}' \
+            && echo "re-dispatched — fresh runners/IPs incoming" \
+            || echo "re-dispatch failed; the schedule will recover the chain"
