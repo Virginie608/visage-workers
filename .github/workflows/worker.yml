@@ -1,9 +1,12 @@
 # Visage worker over GitHub Actions. Auto-generated + auto-wired by the panel's
 # "Set up GitHub workers" action — see control/github_setup.py.
 #
-# Roles: each run has 3 slots — 1 resolves (scrapes profiles -> image tasks),
-# 2 download images (image throughput is the bottleneck). Each passes its role
-# to `visage agent`, which reports it at enroll so the panel pins it.
+# Roles: all 3 slots download images. GitHub's IP range is blocklisted by X --
+# measured at ~0% resolve success from runners against ~47% from a plain VPS --
+# so a resolve slot here does not just fail, it takes targets off the queue and
+# marks them blocked, which is worse than not running at all. Image work is
+# unaffected: pbs.twimg.com serves runners fine. Resolve runs on the Cloudzy
+# VPS pool instead.
 #
 # IP rotation: a run only lives ~30 min, then slot 1 re-dispatches the
 # workflow, so a NEW run spins up on brand-new runners = new machines = new exit
@@ -35,7 +38,7 @@ jobs:
       matrix:
         include:
           - slot: 1
-            role: resolve
+            role: image
           - slot: 2
             role: image
           - slot: 3
